@@ -1,0 +1,436 @@
+#!/usr/bin/perl
+#!/usr/bin/perl -wT
+
+
+
+use strict;
+use warnings;
+use CGI;
+use CGI::Carp; # qw ( fatalsToBrowser );
+use POSIX qw(strftime);
+use Data::Dumper;
+    $Data::Dumper::Sortkeys = 1;
+
+
+exit unless $ENV{'REMOTE_ADDR'} =~ m/192.168.0/;
+
+##########################  USER VARIABLES  ############################
+
+my $db     = "/var/lib/sqlite/bank.db";
+my $tab    = "spend";
+my $tmp    = "append";
+my $upload = "/var/www/uploads";
+my $csv    = "$upload/combined.csv";
+
+###############################  MAIN  #################################
+
+#  my $date = strftime "%Y%m%d", localtime;
+  my ($names,$add);
+
+  &cleanDir($upload);
+   
+  my $query = CGI->new;
+
+  if (defined $query->param && (join ' ',$query->param) =~ m/catmain-/) {
+    &SetCategories($db,$tmp,$query);
+  }
+
+  if (defined $query->param && (join ' ',$query->param) =~ m/catsplit-/) {
+    &SetSplits($db,$tmp,$query); 
+  }
+
+  if (&qCats($db,$tmp) > 0) {
+    &PrintFormCats($query,$db,$tab,$tmp);
+  }
+
+  elsif (&qSplits($db,$tmp) > 0) {
+    &PrintFormSplits($query,$db,$tab,$tmp);
+  }
+
+  elsif (defined $query->param("FILES")) {
+    my $names = &Upload($query); 
+    &Normalize($names,$csv);
+    &LoadFile($db,$tab,$tmp,$csv);
+    if (&qAdd($db,$tmp) > 0) {
+      &PrintFormCats($query,$db,$tab,$tmp); 
+    }
+    else {
+      &PrintFormDone("Previously loaded");
+    }
+  }
+
+  elsif (&qCats($db,$tmp) < 1 && &qSplits($db,$tmp) < 1 && &qAdd($db,$tmp) > 0){
+    &Ingest($db,$tab,$tmp);
+    &PrintFormDone("Complete");
+  }
+
+  elsif (! defined $query->param && &qCats($db,$tmp) < 1) {
+    &PrintFormFiles(&qNew($db,$tab));
+  }
+
+  exit;
+
+##################################################################################
+
+sub qCats {
+  my ($db,$tmp) = (@_);
+
+  return (qx(sqlite3 $db "SELECT count(cat) FROM $tmp WHERE cat IN ('')")) 
+}
+
+
+sub qSplits {
+  my ($db,$tmp) = (@_);
+
+  return (qx(sqlite3 $db "SELECT count(cat) FROM $tmp WHERE cat = 'split' AND spltid IN ('')")); 
+}
+
+sub qNew {
+  my ($db,$tab) = (@_);
+
+  return(qx(sqlite3 $db "SELECT date FROM $tab ORDER BY date DESC LIMIT 1"));
+}
+
+sub qAdd {
+  my ($db,$tmp) = (@_);
+
+  return(qx(sqlite3 $db "SELECT COUNT(*) FROM $tmp"));
+}
+
+
+sub SetSplits {
+  my ($db,$tmp,$query) = (@_);
+
+  my ($splits,$rowid,$row);
+
+  my @splits = $query->param;
+  foreach my $split (@splits) {
+    if ($split =~ m/rowid/) {
+      $rowid = $query->param('rowid');
+    }
+    else {
+      $split =~ m/.*split-(\d+)/;
+      $row = $1;
+    } 
+    next unless $query->param($split) =~ m/\w+|\d+/;
+    $splits->{$row}->{'cat'} =  $query->param($split) if $split =~ m/cat/;
+    $splits->{$row}->{'amt'} = -$query->param($split) if $split =~ m/amt/;
+  }
+  # generate unique splitid (hex value of unix current timestamp)
+  my $splitid = qx(printf '%X\n'  `echo -n \$(date +%s)` | tr -d '\n');
+  my $date = qx(sqlite3 $db "SELECT date FROM $tmp WHERE rowid = '$rowid'");
+  (my $store = qx(sqlite3 $db "SELECT store FROM $tmp WHERE rowid = '$rowid'" )) =~ s/\s*//g;
+  foreach my $row (keys %{$splits}) {
+    qx(sqlite3 $db "INSERT INTO $tmp (spltid,date,store,cat,amt) VALUES('$splitid','$date','$store','$splits->{$row}->{'cat'}','$splits->{$row}->{'amt'}')");
+  }
+  qx(sqlite3 $db "UPDATE $tmp SET spltid = '$splitid' WHERE rowid = '$rowid'");
+}
+
+
+
+
+sub SetCategories {
+  my ($db,$tmp,$query) = (@_);
+
+  my @cats = $query->param;
+
+  foreach my $cat (@cats) {
+    $cat =~ m/catmain-(\d+)/;
+    my $row = $1;
+    my $val = $query->param($cat);
+      qx(sqlite3 $db "UPDATE $tmp SET cat = '$val' WHERE rowid = '$row'");
+  }
+}
+
+
+sub Ingest {
+  my ($db,$tab,$tmp) = (@_);
+
+  qx(sqlite3 $db "UPDATE $tmp SET datestamp = UNIXEPOCH(date)");
+  qx(sqlite3 $db "INSERT INTO $tab (spltid,date,store,cat,amt,datestamp,note) SELECT spltid,date,store,cat,amt,datestamp,note FROM $tmp");
+  qx(sqlite3 $db "DELETE FROM $tmp");
+}
+
+
+sub LoadFile {
+  my ($db,$tab,$tmp,$csv) = (@_);
+
+  # get earliest date of files to be uploaded
+  my $date = qx(cat /var/www/uploads/combined.csv | sort -nrt ',' -k1 | tail -n1 | awk -F',' '{print \$1}');
+
+  # empty temp table
+  qx(sqlite3 $db "DELETE FROM $tmp");
+
+  # load infile csv into temp table
+  qx(sqlite3 --csv $db ".import $csv $tmp"); 
+
+  # copy data from main table from earliest date of current csv into temp table 
+  qx(sqlite3 $db "INSERT INTO $tmp (date,store,cat,amt) SELECT date,store,cat,amt FROM (SELECT CAST(strftime('%s', date) AS INT) as utime, date, store, cat, printf('%.2f', amt) AS amt FROM $tab WHERE utime >= CAST(strftime('%s', '$date') AS INT))");
+
+  # delete duplicates from csv files 
+  qx(sqlite3 $db "DELETE FROM $tmp WHERE rowid NOT IN (SELECT MIN(rowid) FROM $tmp GROUP BY date,store,amt)");
+  # delete entries already in spend table
+  qx(sqlite3 $db "DELETE FROM $tmp WHERE EXISTS (SELECT * FROM $tab WHERE $tmp.date = $tab.date AND $tmp.store = $tab.store AND $tmp.amt = $tab.amt)");
+
+  my $shorts = qx(sqlite3 $db "SELECT DISTINCT(SUBSTR(REPLACE(store,'BILL PAY ',''),'*',12)) as short FROM $tmp");
+  my @shorts = split("\n", $shorts);
+  my $likely;
+
+  foreach my $short (@shorts) {
+    # replace with _ (single character wildcard for sqlite)
+    $short =~ s/[^a-zA-Z0-9 \*]/_/;    
+    my $likely = qx(sqlite3 $db "SELECT cat FROM (SELECT cat, count(cat) as freq FROM $tab WHERE store LIKE '$short\%' GROUP BY cat ORDER BY freq DESC LIMIT 1)");
+    chomp $likely;
+    qx(sqlite3 $db "UPDATE $tmp SET cat = '$likely' WHERE store LIKE '$short%'"); 
+  } 
+}
+
+
+
+
+sub cleanDir {
+  my $dir = shift;
+
+  my ($names,$add);
+  my $date = strftime "%Y%m%d", localtime;
+  my @prev = glob("$dir/*.csv");
+  foreach my $prev (@prev) {
+    qx(rm $prev) unless $prev =~ m/$date/;
+  }
+}
+
+
+
+
+sub Upload {
+  my $query = shift;
+
+  my @names;
+  my @files = $query->upload("FILES");
+  my $date = strftime "%Y%m%d", localtime;
+  my $seq = 0;
+  foreach my $file (@files) { 
+    if (defined $file && $file =~ m/\.csv$/) {
+      my $fh = $file->handle;
+      push @names, "$upload/$date$seq.csv";
+      open (FH, '>', "$upload/$date$seq.csv"); 
+      while (my $bytesread = $fh->read(my $buffer, 1024)) {
+        print FH $buffer;
+      }
+    }
+    close FH;
+    $seq++;
+  }      
+  return (\@names)
+} 	      
+
+
+
+
+
+sub Normalize {
+  my ($names,$outfile) = (@_);
+
+  open (my $fh, '>', $outfile) or die $!;
+  my @norm;
+
+  foreach my $name (@{$names}) {
+
+    open my $file, $name or die "Could not open $name $!\n";
+    while (my $line = <$file>) {
+      chomp $line;
+
+      # remove commas within double quotes (and the double quotes)
+      my $i=0;
+      my $line = join '', grep { $i++ % 2 ? {s/,/ /g} : 1} split /"/,$line;
+
+      # remove backticks and double quotes
+      $line =~ s/`//g;
+      $line =~ s/"//g;
+      my @record = split(',',$line);
+      next unless defined $record[0];
+
+      # fix mm/dd/yyyy (wellsfargo) date to yyyy-mm-dd format
+      if ($record[0] =~ m:(\d+)/(\d+)/(\d+):) {
+        $record[0] = "$3-$1-$2";
+      }       
+
+      if ($record[0] =~ m/\d+\-\d+\-\d+/ && $record[1] =~ m/\d+\-\d+\-\d+/){
+      # this is a cap one file
+        $norm[1] = $record[0];
+        $norm[2] = $record[3];
+        $norm[3] = ''; 
+        if ($record[5] =~ m/[0-9]+/ ) {
+          $norm[4] = -$record[5];
+        }
+        elsif ($record[6] =~ m/[0-9]+/ ) {
+          $norm[4] = $record[6];
+        }
+        $norm[5] = '';
+      }
+      elsif ($record[0] =~ m/\d+\-\d+\-\d+/ && $record[1] !~ m/\d+\-\d+\-\d+/){
+      # this is a wells fargo file
+        $norm[1] = $record[0];
+        $norm[2] = $record[4];
+        $norm[3] = ''; 
+        $norm[4] = $record[1];
+        $norm[5] = '';
+      }
+      else { 
+        next;
+      }        
+      print $fh join ',',map { defined ? $_ : '' } @norm;
+#      print $fh join ',',@norm;
+      print $fh "\n";
+    }
+  }
+  close $fh;
+}
+
+
+
+sub genList {
+  my ($db,$tab) = (@_);
+
+  my $list = "<datalist id='categories'>\n";
+  my $cats = qx(sqlite3 $db "SELECT DISTINCT(cat) FROM $tab");
+  my @cats = split ' ',$cats;
+  foreach my $cat (@cats) {
+    $list .= "<option value=\"$cat\">\n";
+  }
+  $list .= "<option value=\"split\">\n";
+  $list .= "<option value=\"hide\">\n";
+  $list .= "</datalist>\n";
+
+  return $list;
+}
+
+
+  
+sub PrintFormCats {
+  my ($query,$db,$tab,$tmp) = (@_);
+
+  my $add = qx( sqlite3 $db .mode -csv "SELECT rowid,spltid,date,store,cat,amt FROM $tmp" | sed 's/"//g' | tail -n+2 );
+  my @add = split("\n",$add); 
+  my $catlist = &genList($db,$tab);
+
+  print "\n\n<!DOCTYPE html>\n";
+  print "<html>\n";
+  print "<head>\n";
+  print "<meta charset='UTF-8' />\n";
+  print "<title>Budget</title>\n";
+#  print "<link rel='styleshet' type='text/css' href='main.css' />\n";
+  print "</head><body>\n";
+  print "$catlist";
+  print "<form method=\"post\" name=\"cats\" enctype=\"multipart/form-data\">\n"; 
+  print "<p>&nbsp;<p>\n";
+#  print "<table align=center border=0>\n";
+  print "<table style=\"table-layout: fixed; width: 600px;\" align=center border=1>\n";
+  print "<col style=\"width:16%; padding-right: 5px\">\n";
+  print "<col style=\"width:53%;\">\n";
+  print "<col style=\"width:19%;\">\n";
+  print "<col style=\"width:12%; text-align: right;\">\n";
+  print "<thead><tr><th>Date</th><th>Store</th><th>Category</th><th>Amount</th></tr></thead><tbody>\n"; 
+
+  foreach my $line (@add) {
+    chop $line;
+    my @rec = split ',',$line;
+    my $cat;
+    $cat = "<input name=\"catmain-$rec[0]\"  autocomplete=\"on\" type=\"text\" value=\"$rec[4]\" list=\"categories\" pattern=\"[A-Za-z\- ]{3,}\" style=\"width: 100px; border-radius:5px;\"/>";
+   
+    $rec[5] = sprintf("%.2f", $rec[5]);
+#    print "<tr><td style=\"padding-right: 5px; \">$rec[2]</td><td>$rec[3]</td><td>$cat</td><td style=\"text-align: right; padding-right: 10px;\">$rec[5]</td></tr>\n"; 
+    print "<tr><td>$rec[2]</td><td>$rec[3]</td><td>$cat</td><td style=\"text-align: right;\">$rec[5]</td></tr>\n"; 
+  }
+  print "<tr><td></td><td></td><td><input type=\"submit\" value=\"Submit\" style=\"height:75px; width:180px; font-size:2em;\" /></td><td></td></tr></tbody>";
+  print "</table>";
+  print "</form></body></html>";
+  return;
+}
+
+
+
+sub PrintFormSplits {
+  my ($query,$db,$tab,$tmp) = (@_);
+
+
+  my $catlist = &genList($db,$tab);
+
+  my $splits = qx(sqlite3 $db "SELECT rowid,spltid,date,store,cat,amt FROM $tmp WHERE cat = 'split' AND spltid IN ('') LIMIT 1" );
+  my @splits = split(/\|/,$splits); 
+  @splits = map { defined ? $_ : '' } @splits;
+  $splits[5] = -$splits[5];
+
+  print "\n\n<!DOCTYPE html>\n";
+  print "<html>\n";
+  print "<head>\n";
+  print "<meta charset='UTF-8' />\n";
+  print "<title>Splits</title>\n";
+#  print "<link rel='styleshet' type='text/css' href='main.css' />\n";
+  print "</head><body>\n";
+  print "$catlist";
+  print "<form method='post' name='splits' enctype='multipart/form-data'>\n"; 
+  print "<p>&nbsp;<p>\n";
+  print "<table style='table-layout: fixed; width: 250px;' align=center border=0>\n";
+  print "<tr><td colspan=2><div style='font-size: 1.5em; font-weight: bold;'>Split details for:<p></div>$splits[3]<p>$splits[2]</td></tr>\n"; 
+  print "<tr><td colspan=2>&nbsp;</td></tr>\n";
+  print "<tr><th style='text-align: right;'>Category &nbsp; </th><th style='text-align: right;'>Amount &nbsp; </th></tr>\n"; 
+  print "<tr><td colspan=2><hr></td></tr>\n";
+  print "<tr><td></td><td style='text-align: right;'>\$$splits[5] &nbsp; </tr>\n";
+  print "<tr><td><input name='rowid' value='$splits[0]' type='hidden' /></td><td></td></tr>\n";
+  for my $n (1..4) {
+    my $cat = "<input name='catsplit-$n'  autocomplete='on' type='text' list='categories' pattern='[A-Za-z]{3,}' style=\'width: 141px; border-radius:5px;'/>";
+    my $amt = "<input name='amtsplit-$n'  type='text' pattern='[0-9.\-]{2,}' style='border-radius:5px; width: 50px; text-align: right;'/>";
+    print "<tr><td style='text-align: right;'>$cat</td>\n<td style='text-align: right; padding-right: 5px;'>$amt</td></tr>\n"; 
+  }
+  print "<tr><td colspan=2><input type='submit' value='Submit' style='height:50px; width:100%; font-size:2em;' /></td></tr>\n";
+  print "</table>";
+  print "</form></body></html>";
+
+}
+
+
+
+sub PrintFormFiles {
+  my ($last) = (@_);
+
+  # print initial page requesting files to upload
+  print "\n\n<!DOCTYPE html>\n";
+  print "<html>\n";
+  print "<head>\n";
+  print "<meta charset='UTF-8' />\n";
+  print "<title>Budget</title>\n";
+#  print "<link rel='styleshet' type='text/css' href='main.css' />\n";
+  print "</head><body>\n";
+  print "<form method='post' enctype='multipart/form-data' accept-charset='utf-8'>";
+  print "<p>&nbsp;<p><table align=center border=0>\n";
+#  print "<tr><td class=\"titlecell\">Upload: </td>";
+  print "<td><label for 'files'>Upload: </label>";
+  print "<input type='file' name='FILES' id='files' multiple='true' onchange='this.form.submit()'>";
+  print "</td></tr>";
+
+  print "<tr><td colspan=2>&nbsp;</td></tr>\n";
+  print "<tr><td colspan=2>Last Date: $last</td></tr>\n";
+  print "</table>";
+  print "</form></body></html>";
+  return;
+}
+
+
+
+
+sub PrintFormDone {
+  my ($info) = (@_);
+
+  print "\n\n<!DOCTYPE html>\n";
+  print "<html>\n";
+  print "<head>\n";
+  print "<meta charset='UTF-8' />\n";
+  print "<title>Budget</title>\n";
+#  print "<link rel='styleshet' type='text/css' href='main.css' />\n";
+  print "</head><body>\n";
+  print "<p>&nbsp;<p><table align=center border=0>\n";
+  print "<tr><td style='font-size: 2em; font-style: bold;'>$info</td></tr>";
+  print "</table></body></html>";
+
+}
